@@ -1,390 +1,512 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { examAPI } from '../utils/api';
+import {
+  FiClock, FiAlertTriangle, FiSend, FiChevronLeft,
+  FiChevronRight, FiChevronsRight, FiChevronsLeft, FiShield
+} from 'react-icons/fi';
 
-const EXAM_DURATION = 40 * 60; // 40 mins
-const MAX_WARNINGS = 3;
+const EXAM_DURATION = 40 * 60;
+const MAX_WARNINGS  = 3;
+const ALERT_AT      = 5 * 60;
+
+function playBeep(frequency = 880, duration = 0.6, volume = 0.6) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const gainNode = ctx.createGain();
+    gainNode.gain.setValueAtTime(volume, ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    gainNode.connect(ctx.destination);
+    [frequency, frequency * 1.25].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime + i * 0.15);
+      osc.connect(gainNode);
+      osc.start(ctx.currentTime + i * 0.15);
+      osc.stop(ctx.currentTime + duration);
+    });
+  } catch (_) {}
+}
+
+function playUrgentAlarm() {
+  [0, 0.35, 0.7].forEach(delay => {
+    setTimeout(() => playBeep(880, 0.28, 0.7), delay * 1000);
+  });
+}
 
 export default function ExamPage() {
   const navigate = useNavigate();
-  const [questions, setQuestions] = useState([]);
-  const [answers, setAnswers] = useState({});
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [timeLeft, setTimeLeft] = useState(EXAM_DURATION);
-  const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const [warning, setWarning] = useState('');
-  const [warningCount, setWarningCount] = useState(0);
-  const [tabSwitchCount, setTabSwitchCount] = useState(0);
-  const [terminated, setTerminated] = useState(false);
-  const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
-  const [examStartTime, setExamStartTime] = useState(null);
-  const timerRef = useRef(null);
-  const warningRef = useRef(0);
-  const tabSwitchRef = useRef(0);
-  const isSubmitting = useRef(false);
 
-  // --- LOAD EXAM ---
+  const [questions,       setQuestions]       = useState([]);
+  const [answers,         setAnswers]         = useState({});
+  const [currentIndex,    setCurrentIndex]    = useState(0);
+  const [timeLeft,        setTimeLeft]        = useState(EXAM_DURATION);
+  const [loading,         setLoading]         = useState(true);
+  const [submitting,      setSubmitting]      = useState(false);
+  const [warningMsg,      setWarningMsg]      = useState('');
+  const [warningCount,    setWarningCount]    = useState(0);
+  const [terminated,      setTerminated]      = useState(false);
+  const [showSubmitModal, setShowSubmitModal] = useState(false);
+  const [sidebarOpen,     setSidebarOpen]     = useState(true);
+  const [fiveMinAlert,    setFiveMinAlert]    = useState(false);
+
+  const timerRef        = useRef(null);
+  const warningRef      = useRef(0);
+  const tabSwitchRef    = useRef(0);
+  const isSubmittingRef = useRef(false);
+  const answersRef      = useRef({});
+  const fiveMinFiredRef = useRef(false);
+
+  // ── Load exam ──
   useEffect(() => {
-    const loadExam = async () => {
+    const load = async () => {
       try {
         const { data } = await examAPI.start();
         setQuestions(data.questions);
-        setTimeLeft(data.remainingTime);
-        setExamStartTime(new Date(data.examStartTime));
-        setLoading(false);
-        // Enter fullscreen
-        if (document.documentElement.requestFullscreen) {
-          document.documentElement.requestFullscreen().catch(() => {});
+        const remaining = data.remainingTime;
+        setTimeLeft(remaining);
+        if (remaining <= ALERT_AT) {
+          setFiveMinAlert(true);
+          fiveMinFiredRef.current = true;
         }
+        setLoading(false);
+        document.documentElement.requestFullscreen?.().catch(() => {});
       } catch (err) {
         alert(err.response?.data?.message || 'Failed to load exam');
         navigate('/dashboard');
       }
     };
-    loadExam();
+    load();
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [navigate]);
 
-  // --- TIMER ---
-  useEffect(() => {
-    if (loading || terminated) return;
-    timerRef.current = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1) {
-          clearInterval(timerRef.current);
-          handleSubmit('time_expired');
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timerRef.current);
-  }, [loading, terminated]);
-
-  // --- ANTI-CHEAT: Disable right-click ---
-  useEffect(() => {
-    const handleContextMenu = (e) => e.preventDefault();
-    document.addEventListener('contextmenu', handleContextMenu);
-    return () => document.removeEventListener('contextmenu', handleContextMenu);
-  }, []);
-
-  // --- ANTI-CHEAT: Disable copy/paste/cut ---
-  useEffect(() => {
-    const block = (e) => e.preventDefault();
-    document.addEventListener('copy', block);
-    document.addEventListener('paste', block);
-    document.addEventListener('cut', block);
-    return () => {
-      document.removeEventListener('copy', block);
-      document.removeEventListener('paste', block);
-      document.removeEventListener('cut', block);
-    };
-  }, []);
-
-  // --- ANTI-CHEAT: Disable keyboard shortcuts ---
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      // Block common shortcuts
-      if (
-        (e.ctrlKey && ['c','v','x','a','u','s','p','f'].includes(e.key.toLowerCase())) ||
-        (e.altKey && e.key === 'Tab') ||
-        e.key === 'F12' ||
-        (e.ctrlKey && e.shiftKey && ['i','j','c'].includes(e.key.toLowerCase())) ||
-        e.key === 'PrintScreen'
-      ) {
-        e.preventDefault();
-        triggerWarning('keyboard_shortcut', 'Keyboard shortcut blocked');
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
-  // --- ANTI-CHEAT: Tab/window visibility ---
-  useEffect(() => {
-    if (loading || terminated) return;
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        tabSwitchRef.current += 1;
-        setTabSwitchCount(tabSwitchRef.current);
-        triggerWarning('tab_switch', `⚠️ Tab switch detected! Warning ${tabSwitchRef.current}/${MAX_WARNINGS}`);
-      }
-    };
-    const handleBlur = () => {
-      if (!document.hidden) {
-        triggerWarning('window_blur', '⚠️ Window focus lost! Stay on exam window.');
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('blur', handleBlur);
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('blur', handleBlur);
-    };
-  }, [loading, terminated]);
-
-  // --- ANTI-CHEAT: Fullscreen exit ---
-  useEffect(() => {
-    if (loading || terminated) return;
-    const handleFullscreenChange = () => {
-      if (!document.fullscreenElement) {
-        triggerWarning('fullscreen_exit', '⚠️ Fullscreen exited! Please return to fullscreen.');
-        // Re-enter fullscreen
-        setTimeout(() => {
-          if (document.documentElement.requestFullscreen && !document.fullscreenElement) {
-            document.documentElement.requestFullscreen().catch(() => {});
-          }
-        }, 2000);
-      }
-    };
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, [loading, terminated]);
-
-  const triggerWarning = useCallback(async (eventType, message) => {
-    if (isSubmitting.current || terminated) return;
-    warningRef.current += 1;
-    setWarningCount(warningRef.current);
-    setWarning(message);
-    setTimeout(() => setWarning(''), 4000);
-
-    try {
-      const { data } = await examAPI.reportCheat({ eventType, count: warningRef.current });
-      if (data.action === 'terminate' || warningRef.current >= MAX_WARNINGS) {
-        handleSubmit('terminated');
-      }
-    } catch (err) {
-      if (warningRef.current >= MAX_WARNINGS) {
-        handleSubmit('terminated');
-      }
-    }
-  }, [terminated]);
-
-  const handleSubmit = useCallback(async (type = 'manual') => {
-    if (isSubmitting.current) return;
-    isSubmitting.current = true;
+  // ── doSubmit — reads answersRef, never stale ──
+  const doSubmit = useCallback(async (type = 'manual') => {
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     setSubmitting(true);
+
     if (timerRef.current) clearInterval(timerRef.current);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    if (type === 'terminated') setTerminated(true);
 
-    // Exit fullscreen
-    if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
-    }
-
-    if (type === 'terminated') {
-      setTerminated(true);
-    }
-
-    const answersArray = Object.entries(answers).map(([questionId, selectedOption]) => ({
-      questionId: parseInt(questionId),
-      selectedOption
+    const answersArray = Object.entries(answersRef.current).map(([qId, sel]) => ({
+      questionId: parseInt(qId, 10),
+      selectedOption: sel,
     }));
 
     try {
       await examAPI.submit({
-        answers: answersArray,
-        tabSwitchCount: tabSwitchRef.current,
+        answers:          answersArray,
+        tabSwitchCount:   tabSwitchRef.current,
         cheatingWarnings: warningRef.current,
-        submissionType: type
+        submissionType:   type,
       });
-      navigate('/result');
     } catch (err) {
       console.error('Submit error:', err);
-      navigate('/result');
     }
-  }, [answers, navigate]);
+    navigate('/result');
+  }, [navigate]);
 
+  // ── Countdown timer ──
+  useEffect(() => {
+    if (loading || terminated) return;
+
+    timerRef.current = setInterval(() => {
+      setTimeLeft(prev => {
+        const next = prev - 1;
+
+        if (next === ALERT_AT && !fiveMinFiredRef.current) {
+          fiveMinFiredRef.current = true;
+          setFiveMinAlert(true);
+          playUrgentAlarm();
+        }
+
+        if (next < ALERT_AT && next > 0 && next % 30 === 0) {
+          playBeep(660, 0.25, 0.5);
+        }
+
+        if (next <= 10 && next > 0) {
+          playBeep(440, 0.1, 0.4);
+        }
+
+        if (next <= 0) {
+          clearInterval(timerRef.current);
+          doSubmit('time_expired');
+          return 0;
+        }
+
+        return next;
+      });
+    }, 1000);
+
+    return () => clearInterval(timerRef.current);
+  }, [loading, terminated, doSubmit]);
+
+  // ── Anti-cheat: right-click ──
+  useEffect(() => {
+    const block = (e) => e.preventDefault();
+    document.addEventListener('contextmenu', block);
+    return () => document.removeEventListener('contextmenu', block);
+  }, []);
+
+  // ── Anti-cheat: copy / paste / cut ──
+  useEffect(() => {
+    const block = (e) => e.preventDefault();
+    ['copy', 'paste', 'cut'].forEach(ev => document.addEventListener(ev, block));
+    return () => ['copy', 'paste', 'cut'].forEach(ev => document.removeEventListener(ev, block));
+  }, []);
+
+  // ── Anti-cheat: keyboard shortcuts ──
+  useEffect(() => {
+    const handle = (e) => {
+      if (
+        (e.ctrlKey && ['c','v','x','a','u','s','p'].includes(e.key.toLowerCase())) ||
+        (e.ctrlKey && e.shiftKey && ['i','j','c'].includes(e.key.toLowerCase())) ||
+        e.key === 'F12' ||
+        e.key === 'PrintScreen'
+      ) e.preventDefault();
+    };
+    document.addEventListener('keydown', handle);
+    return () => document.removeEventListener('keydown', handle);
+  }, []);
+
+  // ── triggerWarning ──
+  const triggerWarning = useCallback(async (eventType, message) => {
+    if (isSubmittingRef.current || terminated) return;
+    warningRef.current += 1;
+    setWarningCount(warningRef.current);
+    setWarningMsg(message);
+    playBeep(520, 0.3, 0.5);
+    setTimeout(() => setWarningMsg(''), 4000);
+    try {
+      const { data } = await examAPI.reportCheat({ eventType, count: warningRef.current });
+      if (data.action === 'terminate' || warningRef.current >= MAX_WARNINGS) doSubmit('terminated');
+    } catch {
+      if (warningRef.current >= MAX_WARNINGS) doSubmit('terminated');
+    }
+  }, [terminated, doSubmit]);
+
+  // ── Anti-cheat: tab switch / visibility ──
+  useEffect(() => {
+    if (loading || terminated) return;
+    const onVisibility = () => {
+      if (document.hidden) {
+        tabSwitchRef.current += 1;
+        triggerWarning('tab_switch', `Tab switch detected! Warning ${tabSwitchRef.current}/${MAX_WARNINGS}`);
+      }
+    };
+    const onBlur = () => {
+      if (!document.hidden) triggerWarning('window_blur', 'Window focus lost! Return to the exam window.');
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, [loading, terminated, triggerWarning]);
+
+  // ── Anti-cheat: fullscreen ──
+  useEffect(() => {
+    if (loading || terminated) return;
+    const onFsChange = () => {
+      if (!document.fullscreenElement) {
+        triggerWarning('fullscreen_exit', 'Fullscreen exited! Returning to fullscreen...');
+        setTimeout(() => {
+          if (!document.fullscreenElement)
+            document.documentElement.requestFullscreen?.().catch(() => {});
+        }, 1500);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, [loading, terminated, triggerWarning]);
+
+  // ── Select answer — updates ref AND state ──
+  const selectAnswer = (questionId, optionIdx) => {
+    const updated = { ...answersRef.current, [questionId]: optionIdx };
+    answersRef.current = updated;
+    setAnswers(updated);
+  };
+
+  // ── Helpers ──
   const formatTime = (secs) => {
     const m = Math.floor(secs / 60).toString().padStart(2, '0');
     const s = (secs % 60).toString().padStart(2, '0');
     return `${m}:${s}`;
   };
 
-  const currentQuestion = questions[currentIndex];
-  const answered = Object.keys(answers).length;
-  const progress = questions.length > 0 ? Math.round((answered / questions.length) * 100) : 0;
-  const isUrgent = timeLeft <= 300; // last 5 mins
+  const answered   = Object.keys(answers).length;
+  const unanswered = questions.length - answered;
+  const isUrgent   = timeLeft <= ALERT_AT;
   const isCritical = timeLeft <= 60;
+  const q          = questions[currentIndex];
+  const topicColors = { HTML: '#d97706', CSS: '#0891b2', JavaScript: '#7c3aed', React: '#16a34a' };
 
+  // ── Loading screen ──
   if (loading) {
     return (
-      <div className="page-center">
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'white' }}>
         <div style={{ textAlign: 'center' }}>
-          <div className="spinner" style={{ margin: '0 auto 20px' }} />
-          <p style={{ color: 'var(--text-secondary)' }}>Loading your exam...</p>
+          <div className="spinner" style={{ margin: '0 auto 16px' }} />
+          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Preparing your exam…</p>
         </div>
       </div>
     );
   }
 
+  // ── Terminated screen ──
   if (terminated) {
     return (
-      <div className="page-center">
-        <div className="card" style={{ maxWidth: 480, textAlign: 'center' }}>
-          <div style={{ fontSize: 60, marginBottom: 20 }}>🚫</div>
-          <h2 style={{ fontFamily: 'var(--font-display)', fontSize: '1.5rem', color: 'var(--accent-red)', marginBottom: 12 }}>Exam Terminated</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Your exam was terminated due to {warningCount} policy violations. Submitting responses...</p>
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'white' }}>
+        <div className="card" style={{ maxWidth: 440, textAlign: 'center' }}>
+          <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'var(--red-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px' }}>
+            <FiAlertTriangle size={28} color="var(--red)" />
+          </div>
+          <h2 style={{ fontFamily: 'var(--font-display)', fontSize: '1.3rem', color: 'var(--red)', marginBottom: 10 }}>Exam Terminated</h2>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
+            Your exam was terminated due to {warningRef.current} policy violation(s). Submitting your responses…
+          </p>
         </div>
       </div>
     );
   }
 
+  // ── Main exam UI ──
   return (
-    <div style={{ minHeight: '100vh', background: 'var(--bg-primary)', userSelect: 'none' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'white', userSelect: 'none' }}>
+
       {/* Top Bar */}
-      <div style={{ position: 'sticky', top: 0, zIndex: 100, background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border)', padding: '12px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
-        <div style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '1.1rem', color: 'var(--accent-blue)' }}>
-          🎓 SecureAssess
+      <div style={{ height: 56, background: 'white', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 20px', boxShadow: 'var(--shadow-sm)', flexShrink: 0, zIndex: 50 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 28, height: 28, background: 'var(--accent)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <FiShield size={14} color="white" />
+          </div>
+          <span style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
+            PixelWind <span style={{ color: 'var(--accent)' }}>SecureAssess</span>
+          </span>
         </div>
+
         {/* Timer */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 20px', borderRadius: 8, background: isCritical ? 'rgba(239,68,68,0.15)' : isUrgent ? 'rgba(245,158,11,0.1)' : 'rgba(59,130,246,0.1)', border: `1px solid ${isCritical ? 'rgba(239,68,68,0.4)' : isUrgent ? 'rgba(245,158,11,0.4)' : 'var(--border)'}` }}>
-          <span style={{ fontSize: '1.2rem' }}>{isCritical ? '🔴' : isUrgent ? '🟡' : '⏱'}</span>
-          <span style={{ fontFamily: 'monospace', fontWeight: 800, fontSize: '1.5rem', color: isCritical ? 'var(--accent-red)' : isUrgent ? 'var(--accent-yellow)' : 'var(--text-primary)', animation: isCritical ? 'pulse 1s infinite' : 'none' }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '7px 18px', borderRadius: 8,
+          background:   isCritical ? 'var(--red-light)'  : isUrgent ? 'var(--yellow-light)' : 'var(--bg-secondary)',
+          border: `1.5px solid ${isCritical ? '#fecaca' : isUrgent ? '#fde68a'              : 'var(--border)'}`,
+        }}>
+          <FiClock size={16} color={isCritical ? 'var(--red)' : isUrgent ? 'var(--yellow)' : 'var(--accent)'} />
+          <span style={{
+            fontFamily: 'monospace', fontWeight: 800, fontSize: '1.3rem',
+            color: isCritical ? 'var(--red)' : isUrgent ? 'var(--yellow)' : 'var(--text-primary)',
+            animation: isCritical ? 'blink 1s infinite' : 'none',
+          }}>
             {formatTime(timeLeft)}
           </span>
         </div>
-        {/* Stats */}
-        <div style={{ display: 'flex', gap: 16, fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-          <span>✅ {answered}/{questions.length}</span>
-          <span style={{ color: warningCount > 0 ? 'var(--accent-yellow)' : 'var(--text-muted)' }}>
-            ⚠️ {warningCount}/{MAX_WARNINGS}
-          </span>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <div style={{ fontSize: '0.8rem', display: 'flex', gap: 14 }}>
+            <span style={{ color: 'var(--green)', fontWeight: 600 }}>{answered} answered</span>
+            <span style={{ color: warningCount > 0 ? 'var(--red)' : 'var(--text-muted)', fontWeight: 600 }}>
+              <FiAlertTriangle size={12} style={{ marginRight: 3 }} />
+              {warningCount}/{MAX_WARNINGS} warnings
+            </span>
+          </div>
+          <button className="btn btn-success" style={{ padding: '7px 16px', fontSize: '0.8rem', gap: 6 }} onClick={() => setShowSubmitModal(true)}>
+            <FiSend size={14} /> Submit
+          </button>
         </div>
-        <button onClick={() => setShowSubmitConfirm(true)} className="btn btn-success" style={{ padding: '8px 18px', fontSize: '0.875rem' }}>
-          Submit Exam
-        </button>
       </div>
 
-      {/* Warning Banner */}
-      {warning && (
-        <div style={{ background: 'rgba(239,68,68,0.9)', color: 'white', textAlign: 'center', padding: '12px', fontWeight: 700, fontSize: '0.95rem', animation: 'pulse 0.5s ease' }}>
-          {warning}
+      {/* 5-minute alert banner */}
+      {fiveMinAlert && !isCritical && (
+        <div style={{ background: '#fffbeb', borderBottom: '1px solid #fde68a', padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 10, color: '#92400e', fontSize: '0.85rem', fontWeight: 600, flexShrink: 0 }}>
+          <FiClock size={16} color="#d97706" />
+          ⚠️ Only 5 minutes remaining! Please review your answers and submit before time runs out.
+          <button style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: '#92400e', fontSize: '1rem', lineHeight: 1 }} onClick={() => setFiveMinAlert(false)}>✕</button>
         </div>
       )}
 
-      {/* Progress Bar */}
-      <div style={{ height: 3, background: 'var(--bg-card)' }}>
-        <div style={{ height: '100%', width: `${progress}%`, background: 'linear-gradient(90deg, #3b82f6, #06b6d4)', transition: 'width 0.3s ease' }} />
+      {/* Anti-cheat warning banner */}
+      {warningMsg && (
+        <div style={{ background: '#fef2f2', borderBottom: '1px solid #fecaca', padding: '10px 20px', display: 'flex', alignItems: 'center', gap: 8, color: '#991b1b', fontSize: '0.85rem', fontWeight: 600, flexShrink: 0 }}>
+          <FiAlertTriangle size={16} />
+          {warningMsg}
+        </div>
+      )}
+
+      {/* Progress bar */}
+      <div style={{ height: 3, background: 'var(--border)', flexShrink: 0 }}>
+        <div style={{ height: '100%', width: `${questions.length > 0 ? (answered / questions.length) * 100 : 0}%`, background: 'var(--accent)', transition: 'width 0.3s ease' }} />
       </div>
 
-      {/* Main Content */}
-      <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px', display: 'grid', gridTemplateColumns: '1fr 220px', gap: 24 }}>
-        {/* Question Panel */}
-        <div>
-          {/* Question Header */}
-          <div style={{ marginBottom: 20, display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span className={`badge badge-${currentQuestion?.topic === 'HTML' ? 'yellow' : currentQuestion?.topic === 'CSS' ? 'blue' : currentQuestion?.topic === 'JavaScript' ? 'green' : 'blue'}`}>
-              {currentQuestion?.topic}
+      {/* Main layout */}
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+
+        {/* Question area — LEFT */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '28px 36px' }}>
+
+          {/* Topic badge + position */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
+            <span style={{ padding: '4px 12px', borderRadius: 20, fontSize: '0.75rem', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', background: `${topicColors[q?.topic] || 'var(--accent)'}18`, color: topicColors[q?.topic] || 'var(--accent)', border: `1px solid ${topicColors[q?.topic] || 'var(--accent)'}40` }}>
+              {q?.topic}
             </span>
-            <span style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>
+            <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>
               Question {currentIndex + 1} of {questions.length}
             </span>
           </div>
 
-          <div className="card" style={{ marginBottom: 20 }}>
-            <p style={{ fontSize: '1.1rem', fontWeight: 600, lineHeight: 1.7, marginBottom: 28 }}>
-              {currentQuestion?.question}
-            </p>
-            <div style={{ display: 'grid', gap: 12 }}>
-              {currentQuestion?.options.map((opt, idx) => {
-                const isSelected = answers[currentQuestion.id] === idx;
-                return (
-                  <button
-                    key={idx}
-                    onClick={() => setAnswers({ ...answers, [currentQuestion.id]: idx })}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 14, padding: '14px 18px',
-                      background: isSelected ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.03)',
-                      border: `2px solid ${isSelected ? 'var(--accent-blue)' : 'var(--border)'}`,
-                      borderRadius: 'var(--radius-sm)', cursor: 'pointer', textAlign: 'left',
-                      color: isSelected ? 'var(--text-primary)' : 'var(--text-secondary)',
-                      transition: 'all 0.15s ease', fontFamily: 'var(--font-body)', fontSize: '0.95rem',
-                      fontWeight: isSelected ? 600 : 400
-                    }}
-                  >
-                    <span style={{ width: 28, height: 28, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: isSelected ? 'var(--accent-blue)' : 'var(--bg-secondary)', color: isSelected ? 'white' : 'var(--text-muted)', fontSize: '0.8rem', fontWeight: 700, flexShrink: 0 }}>
-                      {String.fromCharCode(65 + idx)}
-                    </span>
-                    {opt}
-                  </button>
-                );
-              })}
-            </div>
+          {/* Question text */}
+          <h2 style={{ fontSize: '1.05rem', fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.75, marginBottom: 28, textAlign: 'left' }}>
+            {q?.question}
+          </h2>
+
+          {/* Options */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 11, marginBottom: 36 }}>
+            {q?.options.map((opt, idx) => {
+              const isSelected = answers[q.id] === idx;
+              return (
+                <button
+                  key={idx}
+                  onClick={() => selectAnswer(q.id, idx)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 14, padding: '13px 18px',
+                    background: isSelected ? 'var(--accent-light)' : 'white',
+                    border: `1.5px solid ${isSelected ? 'var(--accent)' : 'var(--border)'}`,
+                    borderRadius: 10, cursor: 'pointer', textAlign: 'left',
+                    color: isSelected ? 'var(--accent-hover)' : 'var(--text-primary)',
+                    transition: 'all 0.15s ease', fontFamily: 'var(--font)', fontSize: '0.9rem',
+                    fontWeight: isSelected ? 600 : 400,
+                    boxShadow: isSelected ? '0 0 0 3px rgba(26,86,219,0.08)' : 'none',
+                  }}
+                >
+                  <span style={{ width: 28, height: 28, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: isSelected ? 'var(--accent)' : 'var(--bg-secondary)', color: isSelected ? 'white' : 'var(--text-secondary)', fontSize: '0.78rem', fontWeight: 700, flexShrink: 0, border: `1.5px solid ${isSelected ? 'var(--accent)' : 'var(--border)'}` }}>
+                    {String.fromCharCode(65 + idx)}
+                  </span>
+                  {opt}
+                </button>
+              );
+            })}
           </div>
 
           {/* Navigation */}
-          <div style={{ display: 'flex', gap: 12, justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', gap: 10 }}>
             <button className="btn btn-outline" onClick={() => setCurrentIndex(i => Math.max(0, i - 1))} disabled={currentIndex === 0}>
-              ← Previous
+              <FiChevronLeft size={16} /> Previous
             </button>
             <button className="btn btn-outline" onClick={() => setCurrentIndex(i => Math.min(questions.length - 1, i + 1))} disabled={currentIndex === questions.length - 1}>
-              Next →
+              Next <FiChevronRight size={16} />
             </button>
           </div>
         </div>
 
-        {/* Question Navigator */}
-        <div>
-          <div className="card" style={{ padding: '18px' }}>
-            <div style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-              Question Navigator
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 16 }}>
-              {questions.map((q, i) => {
-                const isAnswered = answers[q.id] !== undefined;
-                const isCurrent = i === currentIndex;
-                return (
-                  <button
-                    key={i}
-                    onClick={() => setCurrentIndex(i)}
-                    style={{
-                      width: '100%', aspectRatio: '1', border: `2px solid ${isCurrent ? 'var(--accent-blue)' : isAnswered ? 'var(--accent-green)' : 'var(--border)'}`,
-                      borderRadius: 6, background: isCurrent ? 'rgba(59,130,246,0.2)' : isAnswered ? 'rgba(16,185,129,0.15)' : 'transparent',
-                      color: isCurrent ? 'var(--accent-blue)' : isAnswered ? 'var(--accent-green)' : 'var(--text-muted)',
-                      fontSize: '0.75rem', fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s'
-                    }}
-                  >
-                    {i + 1}
-                  </button>
-                );
-              })}
-            </div>
-            {/* Legend */}
-            <div style={{ display: 'grid', gap: 6, fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={{ width: 12, height: 12, borderRadius: 3, background: 'rgba(59,130,246,0.2)', border: '2px solid var(--accent-blue)' }} />
-                Current
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={{ width: 12, height: 12, borderRadius: 3, background: 'rgba(16,185,129,0.15)', border: '2px solid var(--accent-green)' }} />
-                Answered ({answered})
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={{ width: 12, height: 12, borderRadius: 3, border: '2px solid var(--border)' }} />
-                Unanswered ({questions.length - answered})
-              </div>
-            </div>
+        {/* Sidebar — RIGHT, collapsible */}
+        <div style={{ display: 'flex', flexShrink: 0 }}>
+
+          {/* Toggle strip */}
+          <div
+            style={{ width: 28, background: 'var(--bg-secondary)', borderLeft: '1px solid var(--border)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', paddingTop: 20, cursor: 'pointer' }}
+            onClick={() => setSidebarOpen(o => !o)}
+          >
+            <button style={{ background: 'white', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 5px', cursor: 'pointer', display: 'flex', color: 'var(--text-secondary)', boxShadow: 'var(--shadow-sm)' }}>
+              {sidebarOpen ? <FiChevronsRight size={14} /> : <FiChevronsLeft size={14} />}
+            </button>
           </div>
+
+          {/* Panel */}
+          {sidebarOpen && (
+            <div style={{ width: 240, background: 'var(--bg-secondary)', borderLeft: '1px solid var(--border)', overflowY: 'auto', padding: '16px 14px' }}>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 12 }}>
+                Question Navigator
+              </div>
+
+              {/* Legend */}
+              <div style={{ display: 'flex', gap: 12, marginBottom: 14, fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 12, height: 12, borderRadius: 3, background: 'var(--green)' }} /> Answered
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 12, height: 12, borderRadius: 3, background: 'var(--red-light)', border: '1px solid var(--red)' }} /> Not Answered
+                </div>
+              </div>
+
+              {/* Summary counters */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                <div style={{ flex: 1, padding: '8px 10px', background: 'var(--green-light)', border: '1px solid var(--green-border)', borderRadius: 8, textAlign: 'center' }}>
+                  <div style={{ fontWeight: 800, fontSize: '1.1rem', color: 'var(--green)' }}>{answered}</div>
+                  <div style={{ fontSize: '0.68rem', color: 'var(--green)', fontWeight: 600 }}>Answered</div>
+                </div>
+                <div style={{ flex: 1, padding: '8px 10px', background: 'var(--red-light)', border: '1px solid var(--red-border)', borderRadius: 8, textAlign: 'center' }}>
+                  <div style={{ fontWeight: 800, fontSize: '1.1rem', color: 'var(--red)' }}>{unanswered}</div>
+                  <div style={{ fontSize: '0.68rem', color: 'var(--red)', fontWeight: 600 }}>Remaining</div>
+                </div>
+              </div>
+
+              {/* Question number grid */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 5 }}>
+                {questions.map((qs, i) => {
+                  const isAns = answers[qs.id] !== undefined;
+                  const isCur = i === currentIndex;
+                  return (
+                    <button
+                      key={i}
+                      onClick={() => setCurrentIndex(i)}
+                      style={{
+                        aspectRatio: '1',
+                        border: `2px solid ${isCur ? 'var(--accent)' : isAns ? 'var(--green)' : 'var(--red)'}`,
+                        borderRadius: 6,
+                        background: isCur ? 'var(--accent)' : isAns ? 'var(--green-light)' : 'var(--red-light)',
+                        color: isCur ? 'white' : isAns ? 'var(--green)' : 'var(--red)',
+                        fontSize: '0.7rem', fontWeight: 700, cursor: 'pointer', transition: 'all 0.12s',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}
+                    >
+                      {i + 1}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Submit Confirm Modal */}
-      {showSubmitConfirm && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 24 }}>
-          <div className="card" style={{ maxWidth: 440, width: '100%', textAlign: 'center' }}>
-            <div style={{ fontSize: 40, marginBottom: 16 }}>📤</div>
-            <h3 style={{ fontFamily: 'var(--font-display)', fontSize: '1.3rem', marginBottom: 12 }}>Submit Exam?</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 8 }}>
-              Answered: <strong style={{ color: 'var(--accent-green)' }}>{answered}</strong> / {questions.length}
-            </p>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 24 }}>
-              Unanswered: <strong style={{ color: 'var(--accent-yellow)' }}>{questions.length - answered}</strong> questions will be marked as skipped.
-            </p>
-            <div style={{ display: 'flex', gap: 12 }}>
-              <button className="btn btn-outline btn-full" onClick={() => setShowSubmitConfirm(false)} disabled={submitting}>Cancel</button>
-              <button className="btn btn-success btn-full" onClick={() => handleSubmit('manual')} disabled={submitting}>
-                {submitting ? 'Submitting...' : 'Confirm Submit'}
+      {/* Submit confirm modal */}
+      {showSubmitModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 24 }}>
+          <div className="card" style={{ maxWidth: 420, width: '100%', boxShadow: 'var(--shadow-lg)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+              <div style={{ width: 44, height: 44, borderRadius: 10, background: 'var(--accent-light)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <FiSend size={20} color="var(--accent)" />
+              </div>
+              <div>
+                <h3 style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '1.1rem' }}>Submit Exam?</h3>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>This action cannot be undone</p>
+              </div>
+            </div>
+
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: 8, padding: '14px 16px', marginBottom: 20, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontWeight: 800, fontSize: '1.5rem', color: 'var(--green)' }}>{answered}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Answered</div>
+              </div>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontWeight: 800, fontSize: '1.5rem', color: 'var(--red)' }}>{unanswered}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Unanswered</div>
+              </div>
+            </div>
+
+            {unanswered > 0 && (
+              <div className="alert alert-warning" style={{ marginBottom: 20 }}>
+                <FiAlertTriangle size={15} style={{ flexShrink: 0 }} />
+                <span>{unanswered} unanswered questions will be marked as skipped.</span>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button className="btn btn-outline btn-full" onClick={() => setShowSubmitModal(false)} disabled={submitting}>Cancel</button>
+              <button className="btn btn-success btn-full" onClick={() => doSubmit('manual')} disabled={submitting}>
+                {submitting ? 'Submitting…' : 'Confirm Submit'}
               </button>
             </div>
           </div>
@@ -392,7 +514,7 @@ export default function ExamPage() {
       )}
 
       <style>{`
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
       `}</style>
     </div>
   );
